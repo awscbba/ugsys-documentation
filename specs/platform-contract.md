@@ -5,7 +5,7 @@
 **Last updated**: 2026-02-24
 **Source of truth**: Derived from Registry (registry-api), devsecops-poc, ugsys-identity-manager, ugsys-user-profile-service
 
-> This is the single source of truth for all 5 ugsys microservices.
+> This is the single source of truth for all 6 ugsys microservices.
 > No endpoint, field, event, or business rule should be implemented that is not here.
 > No feature that IS here should be skipped.
 
@@ -24,22 +24,25 @@
 9. [Cross-Cutting Concerns](#9-cross-cutting-concerns)
 10. [Implementation Gap Tracker](#10-implementation-gap-tracker)
 11. [Phase Roadmap](#11-phase-roadmap)
+12. [Verified Infrastructure & Shared Libs Reference](#12-verified-infrastructure--shared-libs-reference)
+13. [Registry Reference Appendix](#section-13--registry-reference-appendix)
+14. [Admin Panel Plugin Architecture](#section-14--admin-panel-plugin-architecture)
 
 ---
 
 ## 1. Platform Overview
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                     API Gateway (per service)                        │
-└──────┬──────────────┬──────────────┬──────────────┬─────────────────┘
-       │              │              │              │
-┌──────▼──────┐ ┌─────▼──────┐ ┌────▼──────┐ ┌────▼──────────────┐
-│  identity-  │ │  user-     │ │ projects- │ │  omnichannel /    │
-│  manager    │ │  profile   │ │ registry  │ │  mass-messaging   │
-└──────┬──────┘ └─────┬──────┘ └────┬──────┘ └────┬──────────────┘
-       │              │              │              │
-       └──────────────┴──────────────┴──────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         API Gateway (per service)                            │
+└──┬──────────┬──────────┬──────────┬──────────┬──────────┬───────────────────┘
+   │          │          │          │          │          │
+┌──▼───┐ ┌───▼───┐ ┌────▼───┐ ┌────▼──────┐ ┌▼────────┐ ┌▼──────────┐
+│iden- │ │user-  │ │proj-   │ │omni-      │ │mass-    │ │admin-     │
+│tity  │ │profile│ │ects    │ │channel    │ │messaging│ │panel (BFF)│
+└──┬───┘ └───┬───┘ └────┬───┘ └────┬──────┘ └┬────────┘ └┬──────────┘
+   │          │          │          │          │           │
+   └──────────┴──────────┴──────────┴──────────┴───────────┘
                               │
                     EventBridge Bus (ugsys-platform-bus)
 ```
@@ -51,6 +54,7 @@
 | Projects Registry | `ugsys-projects-registry` | Phase 2 — pending |
 | Omnichannel | `ugsys-omnichannel-service` | Phase 3 — pending |
 | Mass Messaging | `ugsys-mass-messaging` | Phase 4 — pending |
+| Admin Panel | `ugsys-admin-panel` | Phase 4 — pending |
 
 **Infrastructure**: Lambda + API Gateway, DynamoDB, EventBridge, SES, SNS, S3, CloudFront
 **Region**: us-east-1
