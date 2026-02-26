@@ -2132,6 +2132,184 @@ Every service's CloudWatch log group must have these metric filters and alarms. 
 
 All log groups must have KMS encryption (`CKV_AWS_158`) — enforced by Checkov in CI.
 
+### 9.18 Repository Pattern (all services)
+
+Every `ugsys-*` service MUST implement the repository pattern. This is the authoritative contract — see `.kiro/steering/repository-pattern.md` for full implementation guide with code examples.
+
+#### Port definition (domain layer)
+
+All outbound port interfaces live in `src/domain/repositories/` as ABCs. One file per aggregate root.
+
+```python
+# src/domain/repositories/project_repository.py
+from abc import ABC, abstractmethod
+from src.domain.entities.project import Project
+
+class ProjectRepository(ABC):
+    @abstractmethod
+    async def save(self, project: Project) -> Project: ...
+    @abstractmethod
+    async def find_by_id(self, project_id: str) -> Project | None: ...
+    @abstractmethod
+    async def update(self, project: Project) -> Project: ...
+    @abstractmethod
+    async def delete(self, project_id: str) -> None: ...
+    @abstractmethod
+    async def list_paginated(self, page: int, page_size: int, status_filter: str | None, category_filter: str | None) -> tuple[list[Project], int]: ...
+    @abstractmethod
+    async def list_public(self, limit: int) -> list[Project]: ...
+```
+
+Non-persistence ports (`EventPublisher`, `IdentityClient`, etc.) also live in `src/domain/repositories/`.
+
+#### Concrete implementation (infrastructure layer)
+
+| Port ABC | Concrete class | Location |
+|----------|---------------|----------|
+| `XxxRepository` | `DynamoDBXxxRepository` | `src/infrastructure/persistence/` |
+| `EventPublisher` | `EventBridgePublisher` | `src/infrastructure/messaging/` |
+| `IdentityClient` | `IdentityManagerClient` | `src/infrastructure/adapters/` |
+
+#### Mandatory implementation rules
+
+1. Every `boto3`/`aioboto3` call MUST be wrapped in `try/except ClientError`
+2. `_raise_repository_error(operation, e)` logs full `ClientError` internally, raises `RepositoryError` with safe `user_message` — never exposes DynamoDB error details to callers
+3. `_to_item(entity) -> dict` and `_from_item(item) -> entity` are private serialization methods on every DynamoDB repository
+4. `_from_item` MUST use `.get()` with safe defaults for all optional fields (backward compatibility)
+5. `_to_item` MUST omit optional fields when `None` — never write `{"NULL": True}`
+6. `ConditionalCheckFailedException` on `save` → `RepositoryError`; on `update` → `NotFoundError`
+7. Repositories wired ONLY in `src/main.py` `create_app()` — no global singletons
+
+#### Testing rules
+
+- Unit tests: `AsyncMock(spec=XxxRepository)` — NEVER mock `boto3` directly
+- Integration tests: `moto` `mock_aws` — NEVER call real AWS
+- Integration tests MUST cover: round-trip serialization, backward-compatible deserialization, `ClientError` → `RepositoryError` wrapping
+
+### 9.19 Outbox Pattern (reliable event delivery)
+
+Solves the dual-write problem: when a service must persist state AND publish an event atomically. Write the event to an outbox table in the SAME DynamoDB transaction as the business write. A separate delivery process reads the outbox and publishes to EventBridge.
+
+See `.kiro/steering/enterprise-patterns.md` Section 10 for full implementation guide with code examples.
+
+#### When to use
+
+| Scenario | Approach |
+|----------|----------|
+| Event loss is acceptable (analytics, notifications) | Log-and-continue |
+| Event loss causes data inconsistency | Outbox |
+| Event triggers financial or compliance actions | Outbox |
+| Event is consumed by another service to create/update its own state | Outbox |
+
+#### Outbox table schema
+
+```
+Table: ugsys-outbox-{service}-{env}
+PK: OUTBOX#{ulid}
+SK: EVENT
+GSI: StatusIndex (PK=status, SK=created_at)
+
+Required attributes: id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at, retry_count, status
+```
+
+#### Mandatory rules
+
+1. Outbox write MUST be in the same `TransactWriteItems` as the business write
+2. Delivery process runs on EventBridge Scheduler (1-minute interval)
+3. Events with `retry_count >= 5` → status `failed` + CloudWatch alarm
+4. Published events older than 7 days → cleanup (DynamoDB TTL)
+5. Consumers MUST be idempotent — outbox may re-deliver
+
+### 9.20 Unit of Work (transactional consistency)
+
+Groups multiple repository operations into a single atomic DynamoDB `TransactWriteItems` (up to 100 operations).
+
+See `.kiro/steering/enterprise-patterns.md` Section 11 for full implementation guide with code examples.
+
+#### When to use
+
+- Approving a subscription AND incrementing participant count
+- Creating a form submission AND updating submission count
+- Any multi-aggregate write that must be all-or-nothing
+
+#### Port definition
+
+```python
+# src/domain/repositories/unit_of_work.py
+class UnitOfWork(ABC):
+    @abstractmethod
+    async def execute(self, operations: list[TransactionalOperation]) -> None: ...
+```
+
+#### Mandatory rules
+
+1. `UnitOfWork` ABC lives in `src/domain/repositories/`
+2. `DynamoDBUnitOfWork` lives in `src/infrastructure/persistence/`
+3. Wired in `main.py` alongside repositories — same DynamoDB client
+4. Never mix transactional and non-transactional writes for the same aggregate in the same use case
+5. DynamoDB transaction limit: 100 operations — redesign aggregates if exceeded
+6. Combines naturally with Outbox Pattern: outbox write is another operation in the transaction
+
+### 9.21 Circuit Breaker (external service resilience)
+
+Wraps calls to external services and fast-fails after repeated failures. Prevents cascade failures and gives downstream services time to recover.
+
+See `.kiro/steering/enterprise-patterns.md` Section 12 for full implementation guide with code examples.
+
+#### State machine
+
+```
+CLOSED ──[N failures]──→ OPEN ──[cooldown]──→ HALF_OPEN ──[success]──→ CLOSED
+                                                         ──[failure]──→ OPEN
+```
+
+#### Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `failure_threshold` | 5 | Consecutive failures before opening |
+| `cooldown_seconds` | 30 | Time in OPEN before probing |
+| `half_open_max_calls` | 1 | Probe calls in HALF_OPEN |
+
+#### Mandatory rules
+
+1. One circuit breaker instance per external service — wired in `main.py`
+2. In-memory implementation (Lambda cold starts reset — acceptable for serverless)
+3. Log every state transition with structlog
+4. Never use for DynamoDB calls — those use repository error wrapping
+5. Services that MUST use circuit breaker: `IdentityManagerClient`, `EventBridgePublisher` (when not using outbox)
+6. When circuit is OPEN, raise `ExternalServiceError` with safe `user_message`
+
+### 9.22 Specification / Query Object (composable filters)
+
+Encapsulates query criteria as first-class objects. Prevents `list_paginated()` from growing unbounded parameters.
+
+See `.kiro/steering/enterprise-patterns.md` Section 13 for full implementation guide with code examples.
+
+#### Structure
+
+```python
+# src/application/queries/project_queries.py
+@dataclass(frozen=True)
+class ProjectListQuery:
+    page: int = 1
+    page_size: int = 20
+    status: str | None = None
+    category: str | None = None
+    owner_id: str | None = None
+    sort_by: str = "created_at"
+    sort_order: str = "desc"
+```
+
+#### Mandatory rules
+
+1. One query object per aggregate list operation — `ProjectListQuery`, `SubscriptionListQuery`, etc.
+2. Query objects are frozen dataclasses — immutable after creation
+3. Query objects live in `src/application/queries/`
+4. Repository port accepts the query object — infrastructure translates to DynamoDB operations
+5. Adding a new filter = add field to query object + update `_build_filter_expression()` — no signature changes elsewhere
+6. Admin and public endpoints can share the same query object with different defaults
+
 ---
 
 ## 10. Implementation Gap Tracker
