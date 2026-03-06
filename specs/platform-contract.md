@@ -2,7 +2,7 @@
 
 **Version**: 1.0.0
 **Status**: Authoritative — all implementation must match this document
-**Last updated**: 2026-02-24
+**Last updated**: 2026-03-06
 **Source of truth**: Derived from Registry (registry-api), devsecops-poc, ugsys-identity-manager, ugsys-user-profile-service
 
 > This is the single source of truth for all 6 ugsys microservices.
@@ -32,19 +32,19 @@
 
 ## 1. Platform Overview
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                         API Gateway (per service)                            │
-└──┬──────────┬──────────┬──────────┬──────────┬──────────┬───────────────────┘
-   │          │          │          │          │          │
-┌──▼───┐ ┌───▼───┐ ┌────▼───┐ ┌────▼──────┐ ┌▼────────┐ ┌▼──────────┐
-│iden- │ │user-  │ │proj-   │ │omni-      │ │mass-    │ │admin-     │
-│tity  │ │profile│ │ects    │ │channel    │ │messaging│ │panel (BFF)│
-└──┬───┘ └───┬───┘ └────┬───┘ └────┬──────┘ └┬────────┘ └┬──────────┘
-   │          │          │          │          │           │
-   └──────────┴──────────┴──────────┴──────────┴───────────┘
-                              │
-                    EventBridge Bus (ugsys-platform-bus)
+```mermaid
+graph TD
+    APIGW["API Gateway (per service)"]
+    IM["identity-manager"]
+    UP["user-profile"]
+    PR["projects-registry"]
+    OC["omnichannel"]
+    MM["mass-messaging"]
+    AP["admin-panel (BFF)"]
+    EB[("EventBridge Bus\nugsys-platform-bus")]
+
+    APIGW --> IM & UP & PR & OC & MM & AP
+    IM & UP & PR & OC & MM & AP --> EB
 ```
 
 | Service | Repo | Status |
@@ -252,7 +252,7 @@ All S2S calls use `client_credentials` grant:
 ## 3. Identity Manager
 
 **Repo**: `ugsys-identity-manager`
-**Base URL**: `https://api.cbba.cloud.org.bo/identity` (or Lambda function URL in dev)
+**Base URL**: `https://auth.apps.cloud.org.bo` (or Lambda function URL in dev)
 **DynamoDB table**: `ugsys-identity-{env}-users`
 
 ### 3.1 Domain Entity: User
@@ -632,7 +632,7 @@ Token blacklist table: `ugsys-identity-{env}-token-blacklist`
 ## 4. User Profile Service
 
 **Repo**: `ugsys-user-profile-service`
-**Base URL**: `https://api.cbba.cloud.org.bo/profiles`
+**Base URL**: `https://profiles.apps.cloud.org.bo`
 **DynamoDB table**: `ugsys-profiles-{env}`
 
 ### 4.1 Domain Entity: UserProfile
@@ -741,7 +741,7 @@ Table: `ugsys-profiles-{env}`
 // Request: multipart/form-data, field: "file"
 // Constraints: max 5MB, JPEG/PNG/WebP only
 // Response 200
-{ "avatar_url": "https://cdn.cbba.cloud.org.bo/avatars/550e....jpg" }
+{ "avatar_url": "https://cdn.apps.cloud.org.bo/avatars/550e....jpg" }
 // Side effect: uploads to S3 bucket ugsys-avatars-{env}, sets CloudFront URL
 ```
 
@@ -787,7 +787,7 @@ Transforms Registry `Person` → `UserProfile`:
 ## 5. Projects Registry
 
 **Repo**: `ugsys-projects-registry`
-**Base URL**: `https://api.cbba.cloud.org.bo/projects`
+**Base URL**: `https://api.apps.cloud.org.bo`
 **DynamoDB tables**: `ugsys-projects-{env}`, `ugsys-subscriptions-{env}`, `ugsys-form-submissions-{env}`
 **Source**: Extracted from `Registry/registry-api` — all business logic preserved
 
@@ -975,7 +975,7 @@ class ProjectImage:
   "requirements": "Basic AWS knowledge",
   "registration_end_date": "2026-02-28",
   "enable_subscription_notifications": true,
-  "notification_emails": ["admin@cbba.cloud.org.bo"]
+  "notification_emails": ["admin@apps.cloud.org.bo"]
 }
 // Response 201 — full project object
 // Side effect: publishes projects.project.created
@@ -1124,18 +1124,14 @@ class ProjectImage:
 
 #### Subscription Workflow (frontend decision tree)
 
-```
-POST /public/check-email  { "email": "..." }
-         │
-         ├─ exists: false ──► POST /public/subscribe  → account created + subscription pending
-         │
-         └─ exists: true
-                  │
-                  └─► POST /subscriptions/check  { "personId": "...", "projectId": "..." }
-                               │
-                               ├─ exists: false ──► Show "please login to subscribe"
-                               │
-                               └─ exists: true  ──► Show "already subscribed — login to view status"
+```mermaid
+flowchart TD
+    A["POST /public/check-email\n{ email }"] --> B{exists?}
+    B -->|false| C["POST /public/subscribe\n→ account created + subscription pending"]
+    B -->|true| D["POST /subscriptions/check\n{ personId, projectId }"]
+    D --> E{subscribed?}
+    E -->|false| F["Show: please login to subscribe"]
+    E -->|true| G["Show: already subscribed — login to view status"]
 ```
 
 #### Form Submissions — `/api/v1/form-submissions`
@@ -1170,7 +1166,7 @@ POST /public/check-email  { "email": "..." }
 // Request
 { "filename": "workshop.jpg", "content_type": "image/jpeg", "file_size": 2048000 }
 // Response 200
-{ "data": { "upload_url": "https://s3.amazonaws.com/...", "image_id": "01JZZZ", "cloud_front_url": "https://cdn.cbba.cloud.org.bo/..." } }
+{ "data": { "upload_url": "https://s3.amazonaws.com/...", "image_id": "01JZZZ", "cloud_front_url": "https://cdn.apps.cloud.org.bo/..." } }
 // Constraints: max 10MB, JPEG/PNG/GIF/WebP only
 ```
 
@@ -1198,7 +1194,7 @@ POST /public/check-email  { "email": "..." }
 ## 6. Omnichannel Service
 
 **Repo**: `ugsys-omnichannel-service`
-**Base URL**: `https://api.cbba.cloud.org.bo/omnichannel`
+**Base URL**: `https://messaging.apps.cloud.org.bo`
 **DynamoDB tables**: `ugsys-messages-{env}`, `ugsys-templates-{env}`
 **Phase**: 3 — pending implementation
 
@@ -1284,7 +1280,7 @@ class MessageTemplate:
   "channel": "email",
   "recipient": "user@example.com",
   "template_id": "email-verification",
-  "variables": { "verification_url": "https://cbba.cloud.org.bo/verify?token=..." }
+  "variables": { "verification_url": "https://apps.cloud.org.bo/verify?token=..." }
 }
 // Response 201
 { "data": { "id": "01JXXX", "status": "queued" } }
@@ -1326,7 +1322,7 @@ class MessageTemplate:
 ## 7. Mass Messaging
 
 **Repo**: `ugsys-mass-messaging`
-**Base URL**: `https://api.cbba.cloud.org.bo/campaigns`
+**Base URL**: `https://campaigns.apps.cloud.org.bo`
 **DynamoDB tables**: `ugsys-campaigns-{env}`, `ugsys-audiences-{env}`, `ugsys-campaign-analytics-{env}`
 **Phase**: 4 — pending implementation
 
@@ -2088,7 +2084,7 @@ app.add_middleware(
 # dev
 allowed_origins: list[str] = ["http://localhost:3000", "http://localhost:4321"]
 # prod
-allowed_origins: list[str] = ["https://admin.cbba.cloud.org.bo"]
+allowed_origins: list[str] = ["https://admin.apps.cloud.org.bo"]
 ```
 
 **Rules:**
@@ -2420,7 +2416,7 @@ LOG_LEVEL=INFO
 #### CORS Policy (all API Gateways)
 
 ```
-allow_origins: ["https://cbba.cloud.org.bo"]
+allow_origins: ["https://apps.cloud.org.bo"]
 allow_methods: ANY
 allow_headers: ["Content-Type", "Authorization", "X-Request-ID"]
 max_age: 1 day
@@ -2479,7 +2475,7 @@ validator = TokenValidator(jwt_secret=settings.jwt_secret, jwt_algorithm="HS256"
 payload: TokenPayload | None = validator.validate(token)
 
 # Remote validation fallback (calls /api/v1/auth/validate-token)
-validator = TokenValidator(identity_url="https://api.cbba.cloud.org.bo/identity")
+validator = TokenValidator(identity_url="https://auth.apps.cloud.org.bo")
 payload = await validator.validate_remote(token)
 ```
 
@@ -2506,7 +2502,7 @@ app.add_middleware(AuthMiddleware, validator=validator)
 client = ServiceAuthClient(ServiceCredentials(
     client_id="projects-registry",
     client_secret=settings.service_secret,
-    identity_url="https://api.cbba.cloud.org.bo/identity",
+    identity_url="https://auth.apps.cloud.org.bo",
 ))
 headers = await client.get_headers()  # {"Authorization": "Bearer <token>"}
 ```
@@ -2652,7 +2648,7 @@ The following email types are implemented in Registry and must be ported to `ugs
 | `subscription-status-update` | Generic status change | "Actualización de Suscripción - {project_name}" |
 
 **Email sender**: `"AWS User Group Cochabamba <{from_email}>"` (from `SES_FROM_EMAIL` env var)
-**Admin notification target**: `admin@cbba.cloud.org.bo` (hardcoded in Registry — must be made configurable)
+**Admin notification target**: `admin@apps.cloud.org.bo` (hardcoded in Registry — must be made configurable)
 **Frontend URL**: from `FRONTEND_URL` env var (used in email CTAs)
 
 **Password reset link format**: `{frontend_url}/reset-password?token={reset_token}`
@@ -2698,7 +2694,7 @@ Registry exposes two public endpoints under `/v2/public/`:
 //   - If person does not exist: create person with temp password, create PENDING subscription
 //   - ALL public subscriptions start as PENDING (admin approval required)
 //   - Sends pending-approval email to subscriber
-//   - Sends admin notification email to admin@cbba.cloud.org.bo
+//   - Sends admin notification email to admin@apps.cloud.org.bo
 //   - Race condition handled: retry on duplicate email error
 ```
 
@@ -2713,9 +2709,9 @@ Registry exposes two public endpoints under `/v2/public/`:
 // Request
 { "filename": "workshop.jpg", "content_type": "image/jpeg", "file_size": 2048000 }
 // Response 200
-{ "upload_url": "https://s3.amazonaws.com/...", "image_id": "<UUID4>", "cloud_front_url": "https://cdn.cbba.cloud.org.bo/..." }
+{ "upload_url": "https://s3.amazonaws.com/...", "image_id": "<UUID4>", "cloud_front_url": "https://cdn.apps.cloud.org.bo/..." }
 // Constraints: max 10MB, JPEG/PNG/GIF/WebP only
-// CloudFront URL format: https://cdn.cbba.cloud.org.bo/{filename}
+// CloudFront URL format: https://cdn.apps.cloud.org.bo/{filename}
 ```
 
 ---
@@ -2857,7 +2853,7 @@ Middleware is added in this order (FastAPI processes in reverse — last added =
 6. `AuthorizationMiddleware`
 7. `AuthenticationMiddleware` — added last, executed first (innermost)
 
-> **Note**: Registry uses `allow_origins=["*"]` (all origins). ugsys services must restrict to `["https://cbba.cloud.org.bo"]` per the CDK CORS config.
+> **Note**: Registry uses `allow_origins=["*"]` (all origins). ugsys services must restrict to `["https://apps.cloud.org.bo"]` per the CDK CORS config.
 
 Routers registered:
 - `/v2/people` — `people_router`
@@ -3120,18 +3116,14 @@ This is the authoritative event taxonomy. The ugsys identity-manager audit loggi
 
 Public subscription flow (no auth required at entry point):
 
-```
-POST /v2/people/check-email  { "email": "..." }
-         │
-         ├─ exists: false ──► POST /v2/public/subscribe  → account created + subscription pending
-         │
-         └─ exists: true
-                  │
-                  └─► POST /v2/subscriptions/check  { "email": "...", "projectId": "..." }
-                               │
-                               ├─ subscribed: false ──► Show "please login to subscribe"
-                               │
-                               └─ subscribed: true  ──► Show "already subscribed — login to view status"
+```mermaid
+flowchart TD
+    A["POST /v2/people/check-email\n{ email }"] --> B{exists?}
+    B -->|false| C["POST /v2/public/subscribe\n→ account created + subscription pending"]
+    B -->|true| D["POST /v2/subscriptions/check\n{ email, projectId }"]
+    D --> E{subscribed?}
+    E -->|false| F["Show: please login to subscribe"]
+    E -->|true| G["Show: already subscribed — login to view status"]
 ```
 
 **All new subscriptions start as `pending`** — require admin approval before activation.
@@ -3212,22 +3204,17 @@ From `AUTHENTICATION_SYSTEM.md` — items that differ from ugsys standards and r
 
 Services register themselves at startup (push model). The panel fetches the service registry from identity-manager and renders the appropriate nav and config screens dynamically. No hardcoded service knowledge in the panel code.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                   ugsys-admin-panel                      │
-│   React + Vite SPA  (FSD monorepo)                       │
-│                                                          │
-│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌──────┐  │
-│  │  identity  │ │  projects  │ │ omnichannel│ │  ... │  │
-│  │  /features │ │  /features │ │  /features │ │slice │  │
-│  └────────────┘ └────────────┘ └────────────┘ └──────┘  │
-│         ↑ FSD slices, same bundle, clean domain seams    │
-└──────────────────────────────────────────────────────────┘
-         ↑ service list fetched from identity-manager at runtime
-         ↑ each service registers itself at startup (push)
-
-All API calls → admin panel BFF proxy → target service
-JWT lives in HttpOnly cookie — never in JS memory
+```mermaid
+graph TD
+    subgraph AP["ugsys-admin-panel — React + Vite SPA (FSD monorepo)"]
+        ID["identity\n/features"]
+        PJ["projects\n/features"]
+        OC["omnichannel\n/features"]
+        XX["... more\nslices"]
+    end
+    IM["identity-manager\n(service registry)"]
+    AP -->|"fetches service list at runtime"| IM
+    AP -->|"all API calls via BFF proxy\nJWT in HttpOnly cookie"| BFF["admin-panel BFF"]
 ```
 
 > **Why not micro-frontends**: MFEs are worth the complexity when the bottleneck is organizational scale (many independent teams). We have one team. The costs — remote entry waterfall, version skew matrix, build complexity, and XSS risk from passing JWT to dynamically loaded remote code — exceed the benefit. FSD boundaries inside a monorepo deliver the same domain isolation. See ADR-0005 for full rationale.
@@ -3253,7 +3240,7 @@ Request body:
   "display_name": "Projects Registry",
   "version": "1.2.0",
   "nav_icon": "folder",
-  "health_url": "https://api.cbba.cloud.org.bo/projects/api/v1/health",
+  "health_url": "https://api.apps.cloud.org.bo/api/v1/health",
   "roles": [
     { "name": "projects:admin", "description": "Full projects management" },
     { "name": "projects:viewer", "description": "Read-only access to projects" }
@@ -3303,7 +3290,7 @@ Response `200`:
 {
   "service_id": "ugsys-projects-registry",
   "config": {
-    "admin_notification_email": "admin@cbba.cloud.org.bo",
+    "admin_notification_email": "admin@apps.cloud.org.bo",
     "subscription_approval_required": true
   }
 }
@@ -3382,25 +3369,18 @@ ugsys-admin-panel/src/
 
 #### API call flow (all service admin calls)
 
-```
-SPA → POST /bff/proxy/projects/admin/users
-      Cookie: session=<JWT>  (browser sends automatically)
+```mermaid
+sequenceDiagram
+    participant SPA as Browser SPA
+    participant BFF as Admin Panel BFF
+    participant SVC as Target Service
 
-BFF:
-  1. Reads HttpOnly cookie
-  2. Validates JWT signature (RS256, ugsys-auth-client)
-  3. Checks caller has required role for this proxy route
-  4. Forwards request to target service:
-     POST https://api.cbba.cloud.org.bo/projects/api/v1/admin/users
-     Authorization: Bearer <JWT>
-     X-Request-ID: <correlation-id>
-
-Target service:
-  1. Validates JWT via ugsys-auth-client
-  2. Checks required role from JWT claims
-  3. Returns response
-
-BFF → SPA: forwards response body + status
+    SPA->>BFF: POST /bff/proxy/projects/admin/users<br/>Cookie: session=&lt;JWT&gt;
+    BFF->>BFF: 1. Read HttpOnly cookie<br/>2. Validate JWT (RS256)<br/>3. Check caller role
+    BFF->>SVC: POST https://api.apps.cloud.org.bo/api/v1/admin/users<br/>Authorization: Bearer &lt;JWT&gt;<br/>X-Request-ID: &lt;correlation-id&gt;
+    SVC->>SVC: 1. Validate JWT via ugsys-auth-client<br/>2. Check required role
+    SVC-->>BFF: Response
+    BFF-->>SPA: Forward response body + status
 ```
 
 #### CSRF protection
