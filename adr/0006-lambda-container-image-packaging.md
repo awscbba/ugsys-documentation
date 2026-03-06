@@ -1,4 +1,4 @@
-# ADR-0005: Lambda Container Image Packaging with uv
+# ADR-0006: Lambda Container Image Packaging with uv
 
 **Date**: 2026-03-06
 **Status**: Accepted

@@ -30,148 +30,164 @@ to navigate 5 separate interfaces.
 
 ## Decision
 
-### 1. Frontend architecture — React SPA (monorepo, not micro-frontends)
+### 1. Frontend architecture — React SPA with Plugin Manifest system
 
-**Decision**: The admin panel is a single React + Vite SPA organized as a monorepo with
-Feature-Sliced Design (FSD) internal boundaries. Each service's admin UI is a *slice* inside
-the monorepo, not a separately deployed remote module.
+**Decision**: The admin panel is a single React + Vite SPA (Admin Shell) that dynamically
+loads micro-frontend bundles contributed by registered services. Each service exposes a
+Plugin Manifest at a well-known URL describing its JS bundle, navigation entries, routes,
+required roles, and config schema. The Admin Shell fetches manifests from the BFF and mounts
+the appropriate bundle when the user navigates to a service's section.
 
-**Why not micro-frontends (Module Federation)**:
+**Why not a pure monorepo FSD approach**: The plugin manifest system allows services to ship
+their own admin UI independently without requiring a rebuild of the Admin Shell. Each service
+team controls its own frontend release cadence.
 
-The research is clear: MFEs are worth the complexity when the bottleneck is *organizational
-scale* — many teams shipping independently. We have one team. The costs of MFE are real:
+**Why not Module Federation**: MFEs are worth the complexity when the bottleneck is
+organizational scale (many independent teams). We have one team. The costs are real:
 
 - Remote entry waterfall: N services × N network hops before first render
 - Version skew: compatibility matrix grows as O(N²) across service versions
 - Build complexity: each service needs a federation-aware build pipeline
-- XSS surface: passing JWT as a prop to dynamically loaded remote code is a security risk —
-  any compromised remote module gets the token
-- Vite Module Federation is still maturing; Webpack 5 MF is production-proven but adds
-  significant build overhead
+- XSS surface: passing JWT as a prop to dynamically loaded remote code is a security risk
 
-FSD inside a monorepo gives us the same domain boundaries and independent ownership without
-the distributed deployment complexity. When the team grows to multiple independent teams,
-extracting slices into true MFEs is straightforward because the contracts are already clean.
+The Plugin Manifest approach gives us dynamic service discovery without the MFE build
+complexity. The Admin Shell loads bundles at runtime via dynamic `import()`.
 
-**Fallback trigger**: If a service team genuinely needs independent frontend deployment cadence
-(e.g. a third-party contributor), that slice can be extracted to a true MFE at that point.
-The FSD public API contract makes extraction safe.
+### 2. Service registration — hybrid seed + runtime API
 
-### 2. Service plugin registration — push at startup (backend only)
+Known platform services are pre-seeded from a static configuration file (`config/seed_services.json`)
+loaded at BFF startup. This avoids requiring every service to self-register on every cold start.
 
-Every `ugsys-*` service registers itself with identity-manager at startup via S2S token.
-The registration declares:
+- **Seed entries**: loaded from `config/seed_services.json` at BFF startup via `seed_loader.py`.
+  Marked `registration_source: "seed"`. Cannot be deleted without `force=true`.
+- **Runtime entries**: registered via `POST /api/v1/registry/services` with a valid S2S JWT
+  or by a `super_admin`. Marked `registration_source: "api"`.
+- **Environment overrides**: `SEED_<SERVICE_NAME>_BASE_URL` env vars override seed base URLs
+  per environment without changing the seed file.
 
-- Service identity and display metadata
-- Config schema (JSON Schema) — what parameters the operator can configure
-- Service-specific roles — what RBAC roles this service defines
-
-The admin panel frontend fetches the service registry from identity-manager on load and
-renders the appropriate nav entries and config screens. No frontend remote loading.
+This is a deliberate departure from the original "push at startup" design. Services do not
+need to call the admin panel at startup — the admin panel knows about them via the seed file.
 
 ### 3. Auth — HttpOnly cookie, never JS-accessible token
 
 **Decision**: The admin panel authenticates via identity-manager. The JWT is stored in an
-HttpOnly, Secure, SameSite=Strict cookie — never in localStorage, sessionStorage, or a
+`httpOnly`, `Secure`, `SameSite=Lax` cookie — never in localStorage, sessionStorage, or a
 React prop/context.
 
-**Why**: Passing a JWT as a React prop or storing it in JS-accessible memory means any XSS
-vulnerability (including in a dynamically loaded remote module) can exfiltrate the token.
-HttpOnly cookies are inaccessible to JavaScript by design. The browser sends the cookie
-automatically on every same-origin request.
+**Why**: Any XSS vulnerability (including in a dynamically loaded micro-frontend bundle) can
+exfiltrate a JS-accessible token. HttpOnly cookies are inaccessible to JavaScript by design.
 
-For cross-origin requests to service APIs (different subdomains), the panel uses a
-**BFF (Backend for Frontend)** proxy endpoint on the admin panel's own API Gateway. The
-panel backend reads the HttpOnly cookie, validates it, and forwards the request to the
-target service with the JWT in the `Authorization` header. The frontend never touches the
-raw token.
+For cross-origin requests to service APIs (different subdomains), the panel uses the BFF proxy:
 
-```
-Browser (admin panel SPA)
-  → POST /api/v1/proxy/projects/admin/users   (admin panel BFF)
-    Cookie: session=<HttpOnly JWT>
-  → admin panel BFF validates cookie, extracts JWT
-  → GET https://api.cbba.cloud.org.bo/projects/api/v1/admin/users
-    Authorization: Bearer <JWT>
-  → projects-registry validates JWT via ugsys-auth-client
+```mermaid
+sequenceDiagram
+    participant SPA as Admin Shell
+    participant BFF as Admin Panel BFF
+    participant SVC as Target Service
+
+    SPA->>BFF: POST /api/v1/proxy/{service}/{path}<br/>Cookie: access_token=&lt;JWT&gt; (httpOnly)
+    BFF->>BFF: Validate JWT (RS256)<br/>Check RBAC roles
+    BFF->>SVC: Forward request<br/>Authorization: Bearer &lt;JWT&gt;<br/>X-Request-ID: &lt;correlation-id&gt;
+    SVC-->>BFF: Response
+    BFF-->>SPA: Forward response
 ```
 
-### 4. Service config — stored and served by identity-manager
+### 4. Service config — stored in BFF Service Registry, served via config-schema endpoint
 
-Each service registers a JSON Schema describing its configurable parameters. Identity-manager
-stores both the schema and the operator-set values. Services fetch their own config from
-identity-manager at startup (after registering), overriding env var defaults.
+Each service's Plugin Manifest includes an optional `configSchema` (JSON Schema). The BFF
+stores this schema in the Service Registry DynamoDB table and exposes it via
+`GET /api/v1/registry/services/{service_name}/config-schema`. The Admin Shell renders a
+dynamic form from the schema. Config changes are submitted via
+`POST /api/v1/proxy/{service_name}/config` and validated against the schema before forwarding.
 
-This makes identity-manager the single source of truth for:
-- Which services exist on the platform
-- What roles/permissions each service defines
-- What configurable options each service exposes and their current values
+### 5. RBAC — JWT claims enforced at BFF layer
 
-### 5. RBAC — centralized in identity-manager, service roles declared at registration
+Roles are carried in the JWT `roles` claim (issued by identity-manager). The BFF validates
+roles on every request. The Admin Shell hides navigation entries and disables UI actions
+based on the same role data via a shared RBAC context provider.
 
-Service-specific roles (e.g. `projects:admin`) are declared by each service at registration
-and stored in identity-manager. The admin panel manages all role assignments through
-identity-manager's RBAC endpoints. Services never manage their own role assignments.
+Only users with `super_admin`, `admin`, `moderator`, or `auditor` roles can access the panel.
+`member`, `guest`, and `system` roles receive HTTP 403.
 
 ---
 
 ## Architecture Flow
 
+```mermaid
+flowchart TD
+    subgraph Startup["BFF Startup"]
+        SEED["seed_loader.py\nreads seed_services.json"]
+        SEED -->|upsert| REG[("Service Registry\nDynamoDB")]
+    end
+
+    subgraph Login["Admin Login"]
+        A["Browser → POST /api/v1/auth/login"] --> B["BFF forwards to identity-manager"]
+        B --> C["BFF sets httpOnly cookie\naccess_token + refresh_token"]
+        C --> D["Browser → GET /api/v1/registry/services"]
+        D --> E["Admin Shell renders nav\nfrom Plugin Manifests"]
+    end
+
+    subgraph ProxyFlow["Admin Action"]
+        F["Admin Shell → POST /api/v1/proxy/{service}/{path}"] --> G["BFF validates JWT + RBAC"]
+        G --> H["BFF forwards to target service\nAuthorization: Bearer JWT"]
+        H --> I["Target service validates JWT\nvia ugsys-auth-client"]
+    end
 ```
-Service cold start
-  → POST /api/v1/services/register  (identity-manager, S2S token)
-    { service_id, config_schema, roles[] }
-  → GET  /api/v1/services/{id}/config  (identity-manager, S2S token)
-    → apply operator-set config values over env defaults
 
-Admin opens panel (browser)
-  → GET /api/v1/auth/login  (identity-manager)
-  → JWT stored in HttpOnly cookie by admin panel BFF
-  → GET /api/v1/registry/services  (admin panel BFF → identity-manager)
-  → React SPA renders nav from service list
+## BFF API Surface
 
-Admin configures a service
-  → React SPA calls admin panel BFF proxy endpoint
-  → BFF reads HttpOnly cookie, forwards JWT to target service
-  → Target service validates JWT via ugsys-auth-client
-
-Admin manages users/RBAC
-  → All calls go to identity-manager via BFF proxy
-  → Service-specific roles visible because registered at startup
-```
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/api/v1/auth/login` | None | Authenticate, set httpOnly cookies |
+| POST | `/api/v1/auth/logout` | Cookie | Clear cookies, call identity-manager logout |
+| POST | `/api/v1/auth/refresh` | Cookie | Transparent token refresh |
+| GET | `/api/v1/auth/me` | Cookie | Current user info (JWT + profile enrichment) |
+| POST | `/api/v1/registry/services` | S2S or super_admin | Register/update service |
+| GET | `/api/v1/registry/services` | admin+ | List services (role-filtered) |
+| DELETE | `/api/v1/registry/services/{name}` | super_admin | Deregister service |
+| GET | `/api/v1/registry/services/{name}/config-schema` | admin+ | Get config JSON Schema |
+| ANY | `/api/v1/proxy/{service}/{path}` | admin+ | Forward to downstream service |
+| GET | `/api/v1/health/services` | admin+ | Aggregated health status |
+| GET | `/api/v1/users` | admin+ | Paginated user list (enriched) |
+| PATCH | `/api/v1/users/{id}/roles` | super_admin | Change user roles |
+| PATCH | `/api/v1/users/{id}/status` | admin+ | Activate/deactivate user |
+| GET | `/api/v1/audit/logs` | auditor+ | Paginated audit log |
+| GET | `/health` | None | BFF own health check |
+| POST | `/internal/events` | Infra-level | Receive EventBridge events |
 
 ---
 
 ## Consequences
 
 **Positive**:
+
 - No XSS token exfiltration risk — JWT never in JS memory
-- No remote entry waterfall — single SPA bundle, fast initial load
-- No version skew problem — all admin UI ships together
-- Adding a new service = register at startup + add a FSD slice to the monorepo
-- FSD boundaries make future MFE extraction safe if team scales
+- No remote entry waterfall — Plugin Manifest fetched once, bundle loaded on demand
+- No version skew problem — each service ships its own bundle independently
+- Adding a new service = add to seed file + expose Plugin Manifest endpoint
 - BFF proxy is a natural place to add audit logging for all admin actions
+- Hybrid seed approach means no service needs to call the admin panel at startup
 
 **Negative / accepted trade-offs**:
-- Admin panel frontend must be updated when a new service adds admin UI
-  (mitigated: same team, monorepo, low coordination cost)
+
 - BFF proxy adds one network hop for cross-service admin calls
   (mitigated: admin panel is low-traffic, latency is acceptable)
-- HttpOnly cookie requires CSRF protection (mitigated: SameSite=Strict + CSRF token)
+- HttpOnly cookie requires CSRF protection (mitigated: Double Submit Cookie pattern)
+- Micro-frontend bundles loaded from service origins require CSP configuration
 
 ---
 
 ## Alternatives Considered
 
-- **Module Federation (micro-frontends)**: Rejected for Phase 4. Complexity cost exceeds
-  benefit for a single team. Revisit if team grows to 3+ independent squads.
-- **JWT as React prop / context**: Rejected — XSS risk. Any compromised dependency or
-  dynamic remote gets the token.
+- **Module Federation (micro-frontends)**: Rejected. Complexity cost exceeds benefit for a
+  single team. Revisit if team grows to 3+ independent squads.
+- **JWT as React prop / context**: Rejected — XSS risk.
 - **localStorage for JWT**: Rejected — industry consensus is clear: XSS = game over.
-- **Pull config (static service list in panel)**: Rejected — requires panel code changes
-  every time a service is added.
+- **Push-at-startup registration**: Rejected in favour of hybrid seed approach. Services
+  should not need to know the admin panel's URL, and cold starts should not depend on
+  cross-service registration calls succeeding.
 - **Generic form rendering only (no custom UI per service)**: Available as per-service
-  fallback for simple services, not the primary approach.
+  fallback for simple services via the configSchema form renderer.
 
 ---
 
@@ -179,5 +195,6 @@ Admin manages users/RBAC
 
 - `specs/platform-contract.md` Section 14 — Admin Panel Plugin Contract
 - ADR-0001 — Microservices Architecture
+- ADR-0006 — Lambda Container Image Packaging
 - [Micro-Frontends: Are They Still Worth It in 2025?](https://feature-sliced.design/blog/micro-frontend-architecture)
 - [Stop Storing JWT in LocalStorage: HttpOnly Cookie Strategy](https://openillumi.com/en/en-react-rest-jwt-httponly-security/)
