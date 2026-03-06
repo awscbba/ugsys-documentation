@@ -3194,153 +3194,137 @@ From `AUTHENTICATION_SYSTEM.md` — items that differ from ugsys standards and r
 
 ## Section 14 — Admin Panel Plugin Architecture
 
-*Added: 2026-02-24 — see ADR-0005 for full decision rationale.*
+*Added: 2026-02-24 — Updated: 2026-03-06 to reflect actual implementation. See ADR-0005 for full decision rationale.*
 
 ---
 
 ### 14.1 Overview
 
-`ugsys-admin-panel` is a unified control plane for all platform services. It is a single React + Vite SPA organized as a monorepo with Feature-Sliced Design (FSD) internal boundaries. Each service's admin UI is a *slice* inside the monorepo — not a separately deployed remote module.
+`ugsys-admin-panel` is a unified control plane for all platform services. It is a React + Vite SPA (Admin Shell) that dynamically loads Plugin Manifest bundles contributed by registered services. The Admin Shell fetches manifests from the BFF and mounts the appropriate bundle when the user navigates to a service's section.
 
-Services register themselves at startup (push model). The panel fetches the service registry from identity-manager and renders the appropriate nav and config screens dynamically. No hardcoded service knowledge in the panel code.
+Known platform services are pre-seeded into the BFF Service Registry at startup — services do not need to self-register on every cold start.
 
 ```mermaid
 graph TD
-    subgraph AP["ugsys-admin-panel — React + Vite SPA (FSD monorepo)"]
-        ID["identity\n/features"]
-        PJ["projects\n/features"]
-        OC["omnichannel\n/features"]
-        XX["... more\nslices"]
+    subgraph Startup["BFF Startup"]
+        SEED["seed_loader.py\nreads seed_services.json"]
+        SEED -->|upsert| REG[("Service Registry\nDynamoDB")]
     end
-    IM["identity-manager\n(service registry)"]
-    AP -->|"fetches service list at runtime"| IM
-    AP -->|"all API calls via BFF proxy\nJWT in HttpOnly cookie"| BFF["admin-panel BFF"]
+
+    subgraph Runtime["Runtime"]
+        SPA["Admin Shell\nReact + Vite SPA"]
+        BFF["Admin Panel BFF\nFastAPI Lambda"]
+        SVC["Target Service\n(any ugsys-*)"]
+        SPA -->|"GET /api/v1/registry/services\nfetch Plugin Manifests"| BFF
+        SPA -->|"ANY /api/v1/proxy/{service}/{path}\nCookie: access_token (httpOnly)"| BFF
+        BFF -->|"Forward + Authorization: Bearer JWT"| SVC
+    end
 ```
 
-> **Why not micro-frontends**: MFEs are worth the complexity when the bottleneck is organizational scale (many independent teams). We have one team. The costs — remote entry waterfall, version skew matrix, build complexity, and XSS risk from passing JWT to dynamically loaded remote code — exceed the benefit. FSD boundaries inside a monorepo deliver the same domain isolation. See ADR-0005 for full rationale.
+> **Why not micro-frontends (Module Federation)**: MFEs are worth the complexity when the bottleneck is organizational scale. We have one team. The costs — remote entry waterfall, version skew matrix, build complexity, and XSS risk from passing JWT to dynamically loaded remote code — exceed the benefit. The Plugin Manifest approach gives dynamic service discovery without MFE build complexity. See ADR-0005 for full rationale.
 
 ---
 
 ### 14.2 Service Registration Contract
 
-Every `ugsys-*` service MUST call both endpoints at startup (FastAPI lifespan):
+Services are registered in the BFF Service Registry via one of two mechanisms:
 
-#### 14.2.1 Register with identity-manager (schema + roles)
+#### 14.2.1 Seed registration (primary — no service action required)
+
+Known platform services are pre-seeded from `config/seed_services.json` at BFF startup:
+
+```json
+[
+  {
+    "service_name": "projects-registry",
+    "base_url": "https://api.apps.cloud.org.bo",
+    "health_endpoint": "/api/v1/health",
+    "manifest_url": "/api/v1/admin/manifest.json",
+    "min_role": "admin"
+  }
+]
+```
+
+- Seed entries are marked `registration_source: "seed"` and cannot be deleted without `force=true`
+- Base URLs can be overridden per environment via `SEED_<SERVICE_NAME>_BASE_URL` env vars
+
+#### 14.2.2 Runtime registration (optional — for dynamic services)
+
+Services may register or update their entry at runtime via S2S JWT or `super_admin`:
 
 ```
-POST /api/v1/services/register
-Host: identity-manager
+POST /api/v1/registry/services
+Host: admin-panel BFF (https://admin.apps.cloud.org.bo)
 Authorization: Bearer <service S2S token>
 ```
 
 Request body:
 ```json
 {
-  "service_id": "ugsys-projects-registry",
-  "display_name": "Projects Registry",
-  "version": "1.2.0",
-  "nav_icon": "folder",
-  "health_url": "https://api.apps.cloud.org.bo/api/v1/health",
-  "roles": [
-    { "name": "projects:admin", "description": "Full projects management" },
-    { "name": "projects:viewer", "description": "Read-only access to projects" }
-  ],
-  "config_schema": {
-    "type": "object",
-    "properties": {
-      "max_subscriptions_per_project": {
-        "type": "integer",
-        "default": 100,
-        "description": "Maximum subscriptions allowed per project"
-      },
-      "admin_notification_email": {
-        "type": "string",
-        "format": "email",
-        "description": "Email address for admin notifications"
-      },
-      "subscription_approval_required": {
-        "type": "boolean",
-        "default": false,
-        "description": "Require manual approval for subscriptions"
-      }
-    }
-  }
+  "service_name": "projects-registry",
+  "base_url": "https://api.apps.cloud.org.bo",
+  "health_endpoint": "/api/v1/health",
+  "manifest_url": "/api/v1/admin/manifest.json",
+  "min_role": "admin"
 }
 ```
 
-Response `200`:
-```json
-{ "registered": true, "service_id": "ugsys-projects-registry" }
-```
-
-> Identity-manager stores the schema, roles, and service metadata. The admin panel fetches the full service registry from identity-manager to build its nav and config screens.
-
-#### 14.2.2 Fetch operator config at startup
-
-After registering, each service fetches its operator-set config values and applies them over env var defaults:
-
-```
-GET /api/v1/services/{service_id}/config
-Host: identity-manager
-Authorization: Bearer <service S2S token>
-```
-
-Response `200`:
+Response `201`:
 ```json
 {
-  "service_id": "ugsys-projects-registry",
-  "config": {
-    "admin_notification_email": "admin@apps.cloud.org.bo",
-    "subscription_approval_required": true
-  }
+  "service_name": "projects-registry",
+  "base_url": "https://api.apps.cloud.org.bo",
+  "status": "healthy",
+  "registration_source": "api",
+  "version": 1
 }
 ```
-
-> If no operator config has been set yet, returns `{ "config": {} }` — service uses env var defaults.
 
 ---
 
-### 14.3 Identity-Manager Service Registry Endpoints (new — Phase 4)
+### 14.3 BFF Service Registry Endpoints
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `POST` | `/api/v1/services/register` | S2S token | Register service schema, roles, metadata |
-| `GET` | `/api/v1/services` | `super_admin` JWT | List all registered services with schemas |
-| `GET` | `/api/v1/services/{service_id}` | `super_admin` JWT | Get service schema + roles + metadata |
-| `PUT` | `/api/v1/services/{service_id}/config` | `super_admin` JWT | Set operator config values for a service |
-| `GET` | `/api/v1/services/{service_id}/config` | S2S token or `{service}:admin` JWT | Get current operator config values |
-| `DELETE` | `/api/v1/services/{service_id}` | `super_admin` JWT | Deregister a service (admin only) |
+| `POST` | `/api/v1/registry/services` | S2S or super_admin | Register/update service |
+| `GET` | `/api/v1/registry/services` | admin+ | List services (role-filtered) |
+| `DELETE` | `/api/v1/registry/services/{name}` | super_admin | Deregister service |
+| `GET` | `/api/v1/registry/services/{name}/config-schema` | admin+ | Get config JSON Schema |
 
-> `PUT /config` stores operator-set values in DynamoDB. Services fetch their own config at startup via `GET /config` using their S2S token, overriding env var defaults with operator-set values.
+> Config schemas are stored in the BFF Service Registry DynamoDB table (sourced from each service's Plugin Manifest). The admin panel renders dynamic config forms from these schemas.
 
 ---
 
-### 14.4 Frontend Architecture — React SPA with FSD
+### 14.4 Frontend Architecture — React SPA with Plugin Manifest system
 
-**Stack**: React 18 + Vite + TypeScript + Feature-Sliced Design
+**Stack**: React 18 + Vite + TypeScript + Module Federation (Plugin Manifest pattern)
 
-The admin panel is a single deployable SPA. Each service's admin UI is a FSD *feature slice* inside the monorepo. Slices share a design system, router, and auth context — no network hops between them.
+The Admin Shell is a single deployable SPA. Each service exposes a Plugin Manifest at a well-known URL. The shell fetches manifests via the BFF registry and dynamically loads service bundles on demand.
 
 ```
-ugsys-admin-panel/src/
-├── app/                        # App shell, router, providers
-├── pages/                      # Route-level pages
-│   ├── identity/               # Identity manager admin pages
-│   ├── projects/               # Projects registry admin pages
-│   ├── omnichannel/            # Omnichannel admin pages
-│   ├── mass-messaging/         # Mass messaging admin pages
-│   └── platform/               # Platform-wide config, service registry
-├── features/                   # Cross-cutting features (auth, nav, notifications)
-├── entities/                   # Shared domain models (User, Service, Config)
-├── shared/
-│   ├── ui/                     # Design system components
-│   ├── api/                    # BFF proxy client (typed fetch wrappers)
-│   └── lib/                    # Utilities, hooks
+ugsys-admin-panel/
+├── admin-shell/                # React SPA (Vite)
+│   └── src/
+│       ├── app/                # App shell, router, providers
+│       ├── presentation/
+│       │   └── components/
+│       │       ├── layout/     # TopBar, Sidebar, Layout
+│       │       └── ...
+│       └── infrastructure/
+│           └── http/           # HttpClient, BFF API wrappers
+└── src/                        # FastAPI BFF Lambda
+    ├── presentation/api/v1/
+    │   ├── auth.py             # /api/v1/auth/*
+    │   ├── registry.py         # /api/v1/registry/*
+    │   ├── proxy.py            # /api/v1/proxy/{service}/{path}
+    │   ├── config.py           # /api/v1/proxy/{service}/config
+    │   ├── health.py           # /api/v1/health/services
+    │   ├── users.py            # /api/v1/users/*
+    │   └── audit.py            # /api/v1/audit/logs
+    └── main.py
 ```
 
-**FSD public API rule**: Each slice exports only from its `index.ts`. No deep imports across slices. This is the contract that makes future MFE extraction safe if the team scales.
-
-**Adding a new service**: Add a `pages/{service}/` slice and a `features/{service}-nav/` entry. No changes to the shell or router config — the nav is built dynamically from the identity-manager service registry at runtime.
+**Adding a new service**: Add to `config/seed_services.json` and expose a Plugin Manifest endpoint. No changes to the Admin Shell code required.
 
 ---
 
@@ -3350,176 +3334,123 @@ ugsys-admin-panel/src/
 
 #### Login flow
 
-```
-1. Admin submits credentials to admin panel BFF
-   POST /bff/auth/login  { email, password }
+```mermaid
+sequenceDiagram
+    participant Admin as Admin Browser
+    participant BFF as Admin Panel BFF
+    participant IM as identity-manager
 
-2. BFF calls identity-manager
-   POST /api/v1/auth/login
-
-3. Identity-manager returns RS256 JWT
-
-4. BFF sets HttpOnly, Secure, SameSite=Strict cookie
-   Set-Cookie: session=<JWT>; HttpOnly; Secure; SameSite=Strict; Path=/
-
-5. BFF returns { user, roles } to the SPA (no token in response body)
-
-6. SPA stores only non-sensitive user metadata in React context
+    Admin->>BFF: POST /api/v1/auth/login { email, password }
+    BFF->>IM: POST /api/v1/auth/login
+    IM-->>BFF: { access_token, refresh_token, expires_in }
+    BFF-->>Admin: Set-Cookie: access_token=&lt;JWT&gt;; HttpOnly; Secure; SameSite=Lax
+    Note over Admin: Token never in JS memory
+    Admin->>BFF: GET /api/v1/registry/services (Cookie: access_token)
+    BFF-->>Admin: Service list + Plugin Manifests
 ```
 
 #### API call flow (all service admin calls)
 
 ```mermaid
 sequenceDiagram
-    participant SPA as Browser SPA
+    participant SPA as Admin Shell
     participant BFF as Admin Panel BFF
     participant SVC as Target Service
 
-    SPA->>BFF: POST /bff/proxy/projects/admin/users<br/>Cookie: session=&lt;JWT&gt;
-    BFF->>BFF: 1. Read HttpOnly cookie<br/>2. Validate JWT (RS256)<br/>3. Check caller role
-    BFF->>SVC: POST https://api.apps.cloud.org.bo/api/v1/admin/users<br/>Authorization: Bearer &lt;JWT&gt;<br/>X-Request-ID: &lt;correlation-id&gt;
-    SVC->>SVC: 1. Validate JWT via ugsys-auth-client<br/>2. Check required role
+    SPA->>BFF: ANY /api/v1/proxy/{service}/{path}<br/>Cookie: access_token=&lt;JWT&gt; (httpOnly)
+    BFF->>BFF: Validate JWT (RS256)<br/>Check RBAC roles
+    BFF->>SVC: Forward request<br/>Authorization: Bearer &lt;JWT&gt;<br/>X-Request-ID: &lt;correlation-id&gt;
+    SVC->>SVC: Validate JWT via ugsys-auth-client
     SVC-->>BFF: Response
-    BFF-->>SPA: Forward response body + status
+    BFF-->>SPA: Forward response
 ```
 
 #### CSRF protection
 
-All state-mutating BFF endpoints require a CSRF token:
-- On login, BFF sets a second cookie: `csrf_token=<random>; SameSite=Strict; Secure` (NOT HttpOnly — JS must read it)
+All state-mutating BFF endpoints use the Double Submit Cookie pattern:
+- BFF sets `csrf_token=<random>; SameSite=Lax; Secure` (NOT HttpOnly — JS must read it)
 - SPA reads `csrf_token` cookie and sends it as `X-CSRF-Token` header on every POST/PUT/DELETE
 - BFF validates that `X-CSRF-Token` header matches the `csrf_token` cookie value
-
-> `SameSite=Strict` on the session cookie already prevents most CSRF. The explicit CSRF token is defense-in-depth.
-
-#### BFF proxy route table
-
-| BFF path prefix | Proxied to |
-|-----------------|-----------|
-| `/bff/proxy/identity/` | `ugsys-identity-manager` admin endpoints |
-| `/bff/proxy/projects/` | `ugsys-projects-registry` admin endpoints |
-| `/bff/proxy/omnichannel/` | `ugsys-omnichannel-service` admin endpoints |
-| `/bff/proxy/messaging/` | `ugsys-mass-messaging` admin endpoints |
-| `/bff/proxy/profiles/` | `ugsys-user-profile-service` admin endpoints |
 
 ---
 
 ### 14.6 RBAC for Admin Panel
 
-All service-specific roles are defined by each service at registration time and stored in identity-manager. The admin panel manages role assignments through identity-manager's existing RBAC endpoints.
+Roles are carried in the JWT `roles` claim (issued by identity-manager). The BFF validates roles on every request.
 
-Platform-level roles:
+Platform-level roles enforced by the BFF:
 
 | Role | Access |
 |------|--------|
 | `super_admin` | Full access to all services, platform config, service registry |
-| `{service}:admin` | Full access to that service's admin slice only |
-| `{service}:viewer` | Read-only access to that service's admin slice |
+| `admin` | Access to services where `min_role = "admin"` |
+| `moderator` | Access to services where `min_role = "moderator"` |
+| `auditor` | Read-only access + audit log |
+| `member`, `guest`, `system` | HTTP 403 — no admin panel access |
 
-> `super_admin` is the only role that can manage other admins and update service configs. It is assigned only through identity-manager directly — never through the admin panel itself (prevents privilege escalation loop).
-
-The BFF enforces role checks before proxying. A `projects:admin` user cannot reach `/bff/proxy/omnichannel/` — the BFF rejects the request before it ever hits the target service.
-
----
-
-### 14.7 Service Startup Sequence (with registration)
-
-```python
-# src/main.py — lifespan pattern (every ugsys-* service)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    logger.info("startup.begin", service=settings.service_name, version=settings.version)
-
-    # 1. Register with identity-manager (schema + roles + metadata)
-    #    Non-fatal: log warning and continue if identity-manager is unreachable
-    try:
-        await identity_manager_client.register_service(
-            service_id=settings.service_id,
-            display_name=settings.display_name,
-            version=settings.version,
-            nav_icon=settings.nav_icon,
-            health_url=f"{settings.public_base_url}/api/v1/health",
-            config_schema=SERVICE_CONFIG_SCHEMA,
-            roles=SERVICE_ROLES,
-        )
-        logger.info("service.registered", service=settings.service_id)
-    except Exception as e:
-        logger.warning("service.registration_failed", service=settings.service_id, error=str(e))
-
-    # 2. Fetch operator config from identity-manager (overrides env defaults)
-    #    Non-fatal: if unreachable, service runs with env var defaults
-    try:
-        config = await identity_manager_client.get_service_config(settings.service_id)
-        settings.apply_remote_config(config)
-        logger.info("service.config_loaded", service=settings.service_id)
-    except Exception as e:
-        logger.warning("service.config_load_failed", service=settings.service_id, error=str(e))
-
-    logger.info("startup.complete", service=settings.service_name)
-    yield
-    logger.info("shutdown.complete", service=settings.service_name)
-```
-
-> Both calls are non-fatal. A service that cannot reach identity-manager at startup still serves its primary API with env var defaults. This prevents a cascading failure where identity-manager downtime takes down all services.
+> `super_admin` is the only role that can deregister services and change user roles. It is assigned only through identity-manager directly.
 
 ---
 
-### 14.8 Admin Panel BFF — Architecture
+### 14.7 BFF Startup Sequence
 
-The BFF (Backend for Frontend) is a lightweight FastAPI Lambda that:
-- Handles login/logout and manages the HttpOnly session cookie
-- Proxies all admin API calls to target services (adding `Authorization` header)
-- Enforces role-based access per proxy route before forwarding
-- Adds correlation IDs to all proxied requests
-- Logs all admin actions (audit trail)
+```mermaid
+flowchart TD
+    A["Lambda cold start"] --> B["Wire DI: circuit breakers, HTTP adapters,\nDynamoDB repos, EventBridge publisher"]
+    B --> C["load_seed_services()\nread seed_services.json → upsert DynamoDB"]
+    C --> D["health_aggregator_service.start_polling()\nbegin background health checks"]
+    D --> E["BFF ready — serving requests"]
+```
 
-```
-ugsys-admin-panel/
-├── bff/                        # FastAPI BFF Lambda
-│   ├── src/
-│   │   ├── presentation/api/v1/
-│   │   │   ├── auth.py         # /bff/auth/login, /bff/auth/logout, /bff/auth/me
-│   │   │   └── proxy.py        # /bff/proxy/{service}/{path:path}
-│   │   ├── application/
-│   │   │   └── services/
-│   │   │       ├── auth_service.py     # cookie management, CSRF
-│   │   │       └── proxy_service.py    # JWT validation, role check, forward
-│   │   ├── infrastructure/
-│   │   │   └── adapters/
-│   │   │       └── identity_manager_client.py
-│   │   └── config.py
-│   └── main.py
-└── frontend/                   # React SPA (Vite)
-    └── src/  (FSD structure above)
-```
+Services do not need to call the admin panel at startup. The BFF knows about all platform services via the seed file.
+
+---
+
+### 14.8 BFF API Surface
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/api/v1/auth/login` | None | Authenticate, set httpOnly cookies |
+| POST | `/api/v1/auth/logout` | Cookie | Clear cookies, call identity-manager logout |
+| POST | `/api/v1/auth/refresh` | Cookie | Transparent token refresh |
+| GET | `/api/v1/auth/me` | Cookie | Current user info (JWT + profile enrichment) |
+| POST | `/api/v1/registry/services` | S2S or super_admin | Register/update service |
+| GET | `/api/v1/registry/services` | admin+ | List services (role-filtered) |
+| DELETE | `/api/v1/registry/services/{name}` | super_admin | Deregister service |
+| GET | `/api/v1/registry/services/{name}/config-schema` | admin+ | Get config JSON Schema |
+| ANY | `/api/v1/proxy/{service}/{path}` | admin+ | Forward to downstream service |
+| GET | `/api/v1/health/services` | admin+ | Aggregated health status |
+| GET | `/api/v1/users` | admin+ | Paginated user list (enriched) |
+| PATCH | `/api/v1/users/{id}/roles` | super_admin | Change user roles |
+| PATCH | `/api/v1/users/{id}/status` | admin+ | Activate/deactivate user |
+| GET | `/api/v1/audit/logs` | auditor+ | Paginated audit log |
+| GET | `/health` | None | BFF own health check |
+| POST | `/internal/events` | Infra-level | Receive EventBridge events |
 
 ---
 
 ### 14.9 Gap Tracker — Admin Panel (Phase 4)
 
-| Gap | Priority | Phase |
-|-----|----------|-------|
-| Scaffold `ugsys-admin-panel` repo (BFF + React SPA) | P0 | 4 |
-| BFF: `POST /bff/auth/login` — sets HttpOnly cookie | P0 | 4 |
-| BFF: `POST /bff/auth/logout` — clears cookie | P0 | 4 |
-| BFF: `GET /bff/proxy/{service}/{path}` — proxy with JWT forwarding | P0 | 4 |
-| BFF: role-based proxy route guard | P0 | 4 |
-| BFF: CSRF token cookie + header validation | P0 | 4 |
-| `POST /api/v1/services/register` in identity-manager | P0 | 4 |
-| `GET/PUT /api/v1/services/{id}/config` in identity-manager | P0 | 4 |
-| Service registry DynamoDB table in identity-manager | P0 | 4 |
-| React SPA: FSD structure + nav built from service registry | P0 | 4 |
-| React SPA: identity-manager admin slice (users, RBAC) | P0 | 4 |
-| React SPA: projects-registry admin slice | P1 | 4 |
-| React SPA: omnichannel admin slice | P1 | 4 |
-| React SPA: mass-messaging admin slice | P1 | 4 |
-| React SPA: platform config slice (service registry viewer) | P1 | 4 |
-| `super_admin` bootstrap — first admin creation flow | P0 | 4 |
-| BFF: audit log for all admin actions (structlog → CloudWatch) | P1 | 4 |
-| `settings.apply_remote_config()` in every service | P1 | 4 |
-| Contract tests: BFF proxy routes vs service admin endpoints | P1 | 4 |
+| Gap | Priority | Status |
+|-----|----------|--------|
+| BFF Lambda deployed to `ugsys-admin-panel-prod` | P0 | Done |
+| BFF: `POST /api/v1/auth/login` — sets httpOnly cookie | P0 | Done |
+| BFF: `POST /api/v1/auth/logout` — clears cookie | P0 | Done |
+| BFF: `ANY /api/v1/proxy/{service}/{path}` — proxy with JWT forwarding | P0 | Done |
+| BFF: role-based proxy route guard | P0 | Done |
+| BFF: CSRF Double Submit Cookie pattern | P0 | Done |
+| BFF: Service Registry (DynamoDB) + seed loader | P0 | Done |
+| BFF: audit log for all admin actions (structlog → CloudWatch) | P0 | Done |
+| BFF: health aggregation polling | P1 | Done |
+| Admin Shell SPA deployed to https://admin.apps.cloud.org.bo | P0 | Done |
+| Admin Shell: Plugin Manifest dynamic loading | P0 | In Progress |
+| Admin Shell: identity-manager admin slice (users, RBAC) | P0 | In Progress |
+| Admin Shell: projects-registry admin slice | P1 | Pending |
+| Admin Shell: omnichannel admin slice | P1 | Pending |
+| Admin Shell: mass-messaging admin slice | P1 | Pending |
+| `super_admin` bootstrap — first admin creation flow | P0 | Pending |
+| Contract tests: BFF proxy routes vs service admin endpoints | P1 | Pending |
 
 ---
 
-*Section 14 added: 2026-02-24 — see ADR-0005 for full decision rationale.*
+*Section 14 added: 2026-02-24 — Updated: 2026-03-06 — see ADR-0005 for full decision rationale.*
