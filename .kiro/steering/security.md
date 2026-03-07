@@ -22,8 +22,13 @@ inclusion: always
 **Why both Bandit and Semgrep**: Bandit is fast and Python-specific; Semgrep catches complex patterns (SQL injection, XSS, SSRF, unsafe deserialization) that Bandit misses. No single scanner catches everything.
 
 **Git hooks** (install via `just install-hooks`):
-- `pre-commit`: blocks commits to `main`; runs ruff lint + format + unit tests
+
+Choose the pattern based on service type:
+
+- **Backend-only services**: `pre-commit` runs ruff lint + format + unit tests; `pre-push` runs mypy strict
+- **Full-stack services**: `pre-commit` runs lint + format only (fast); `pre-push` runs type-check + full test suite with coverage gates
 - Never bypass with `--no-verify`
+- All hooks must block direct commits/pushes to `main`
 
 ## Ruff Security Rules (REQUIRED in pyproject.toml)
 
